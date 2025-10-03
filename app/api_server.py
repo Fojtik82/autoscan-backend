@@ -1,13 +1,16 @@
-﻿from typing import Optional, List
-from fastapi import FastAPI, Header, HTTPException, Query
+﻿# app/api_server.py
+from typing import Optional, List
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import aiosqlite
 
-from .db import init_db
-from .config import ALLOWED_ORIGINS, API_KEY, FRESH_HOURS_DEFAULT, DB_PATH
+from .db import init_db, DB_PATH
+from .config import ALLOWED_ORIGINS, API_KEY, FRESH_HOURS_DEFAULT
 from .estimators import estimate_from_rows
 
+
+# --- FastAPI ---
 app = FastAPI(title="AutoScan Comps API", version="1.0")
 
 # CORS
@@ -19,15 +22,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# Init DB při startu
 @app.on_event("startup")
-async def startup():
+async def startup() -> None:
     await init_db()
 
-def _auth(x_api_key: Optional[str]):
+
+def _auth(x_api_key: Optional[str]) -> None:
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-# ------------ MODELS ------------
+
+# ---------- MODELS ----------
 class Comp(BaseModel):
     source: str
     url: Optional[str] = None
@@ -42,6 +49,7 @@ class Comp(BaseModel):
     price_czk: int
     scraped_at: str
 
+
 class EstimateReq(BaseModel):
     brand: str
     model: str
@@ -55,14 +63,18 @@ class EstimateReq(BaseModel):
     window_year: int = 1
     limit: int = 120
 
-# ------------ ROUTES ------------
+
+# ---------- ROUTES ----------
 @app.get("/health")
 async def health():
     return {"ok": True, "service": "autoscan-backend"}
 
+
 @app.get("/debug/db")
 async def dbg_db():
+    # rychlá kontrola, jaký soubor SQLite se používá
     return {"DB_PATH": DB_PATH}
+
 
 @app.get("/debug/count")
 async def dbg_count(
@@ -70,36 +82,49 @@ async def dbg_count(
     model: str,
     year: int,
     mileage: int,
-    window_km: int = 20000,
-    window_year: int = 1,
+    window_km: int = 60000,
+    window_year: int = 3,
 ):
+    """
+    Vrátí jen COUNT(*) pro stejný filtr jako /comps – užitečné pro ladění.
+    """
     sql = """
-    SELECT COUNT(*)
-    FROM listings_fresh
-    WHERE LOWER(brand) LIKE LOWER(?)
-      AND LOWER(model) LIKE LOWER(?)
-      AND year BETWEEN ? AND ?
-      AND ABS(mileage - ?) <= ?
+        SELECT COUNT(*)
+        FROM listings_fresh
+        WHERE LOWER(brand) LIKE LOWER(?)
+          AND LOWER(model) LIKE LOWER(?)
+          AND year BETWEEN ? AND ?
+          AND ABS(mileage - ?) <= ?
     """
     args = [
         f"%{brand}%",
         f"%{model}%",
-        year - window_year, year + window_year,
-        mileage, window_km
+        year - window_year,
+        year + window_year,
+        mileage,
+        window_km,
     ]
-    async with aiosqlite.connect(DB_PATH) as db:
-        row = await db.execute_fetchone(sql, args)
-        cnt = row[0] if row else 0
-    return {"count": cnt, "args": args, "DB_PATH": DB_PATH}
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(sql, args)
+            row = await cur.fetchone()         # <-- správný způsob v aiosqlite
+            count = row[0] if row is not None else 0
+        return {"count": count, "args": args, "DB_PATH": DB_PATH}
+    except Exception as e:
+        # ať je při ladění hned vidět přesná chyba
+        raise HTTPException(status_code=500, detail=f"dbg_count error: {e}")
+
 
 @app.get("/comps", response_model=List[Comp])
 async def comps(
-    brand: str = Query(..., description="např. 'Škoda' (LIKE)"),
-    model: str = Query(..., description="např. 'Octavia' (LIKE)"),
-    year: int = Query(..., description="cílový rok"),
-    mileage: int = Query(..., description="cílový nájezd km"),
-    fuel: str = Query("", description="volitelné (LIKE)"),
-    motor: str = Query("", description="volitelné (LIKE)"),
+    brand: str,
+    model: str,
+    year: int,
+    mileage: int,
+    fuel: str = "",
+    motor: str = "",
     window_km: int = 20000,
     window_year: int = 1,
     fresh_hours: int = FRESH_HOURS_DEFAULT,
@@ -107,11 +132,9 @@ async def comps(
     x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
 ):
     """
-    Vrátí srovnatelné vozy z `listings_fresh` (VIEW nad `vehicles_clean`, založí se při startu).
-    - Brand/Model = LIKE (volné hledání)
-    - Rok v intervalu [year ± window_year]
-    - Nájezd v intervalu [mileage ± window_km]
-    - Pokud `scraped_at='n/a'`, filtr čerstvosti se neaplikuje.
+    Vrátí podobné inzeráty z listings_fresh (může to být i VIEW nad vehicles_clean).
+    Brand/model matchují přes LIKE (volnější chování).
+    Pokud scraped_at='n/a', ignoruje se čerstvost.
     """
     _auth(x_api_key)
 
@@ -128,11 +151,14 @@ async def comps(
     ORDER BY ABS(mileage - ?), ABS(year - ?)
     LIMIT ?
     """
+
     args = [
         f"%{brand}%",
         f"%{model}%",
-        year - window_year, year + window_year,
-        mileage, window_km,
+        year - window_year,
+        year + window_year,
+        mileage,
+        window_km,
         (fuel or ""), f"%{(fuel or '').lower()}%",
         (motor or ""), f"%{(motor or '').lower()}%",
         fresh_hours,
@@ -143,10 +169,12 @@ async def comps(
     out: list[dict] = []
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(sql, args) as cur:
-            async for r in cur:
-                out.append(dict(r))
+        cur = await db.execute(sql, args)
+        rows = await cur.fetchall()
+        for r in rows:
+            out.append(dict(r))
     return out
+
 
 @app.post("/price/estimate")
 async def price_estimate(
@@ -154,7 +182,7 @@ async def price_estimate(
     x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
 ):
     """
-    Vrátí robustní odhad ceny (median + IQR) z /comps (nebo z poslaných `rows`).
+    Spočítá vážený medián + IQR z /comps (nebo z poslaných `rows`).
     """
     _auth(x_api_key)
 
@@ -174,8 +202,9 @@ async def price_estimate(
             x_api_key=x_api_key,
         )
 
-    est = estimate_from_rows(rows, body.year, body.mileage, (body.motor or ""))
+    est = estimate_from_rows(rows, body.year, body.mileage, body.motor or "")
     if not est:
         return {"found": 0, "message": "No comparable rows"}
+
     est["found"] = est["count"]
     return est
