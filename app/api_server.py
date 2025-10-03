@@ -9,11 +9,43 @@ from .db import init_db, DB_PATH
 from .config import ALLOWED_ORIGINS, API_KEY, FRESH_HOURS_DEFAULT
 from .estimators import estimate_from_rows
 
+# ----------------- Helpers: fold/normalize (bez diakritiky) -----------------
+def fold_input(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    x = s.strip().lower()
+    return (
+        x.replace("á", "a").replace("ä", "a").replace("â", "a")
+         .replace("č", "c")
+         .replace("ď", "d")
+         .replace("é", "e").replace("ě", "e").replace("ë", "e")
+         .replace("í", "i").replace("ï", "i")
+         .replace("ľ", "l").replace("ĺ", "l")
+         .replace("ň", "n")
+         .replace("ó", "o").replace("ô", "o")
+         .replace("ř", "r")
+         .replace("š", "s")
+         .replace("ť", "t")
+         .replace("ú", "u").replace("ů", "u").replace("ü", "u")
+         .replace("ý", "y")
+         .replace("ž", "z")
+    )
 
-# --- FastAPI ---
-app = FastAPI(title="AutoScan Comps API", version="1.0")
+def norm_fuel(s: Optional[str]) -> Optional[str]:
+    if not s or not s.strip():
+        return None
+    x = fold_input(s)
+    if "naft" in x or "diesel" in x:
+        return "diesel"
+    if "benz" in x or "petrol" in x or "gasoline" in x:
+        return "petrol"
+    if x.startswith("elect"):
+        return "elect."
+    return x
 
-# CORS
+# ----------------- FastAPI -----------------
+app = FastAPI(title="AutoScan Comps API", version="1.1")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else ["*"],
@@ -22,22 +54,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# Init DB při startu
 @app.on_event("startup")
-async def startup() -> None:
+async def startup():
     await init_db()
 
-
-def _auth(x_api_key: Optional[str]) -> None:
+def _auth(x_api_key: Optional[str]):
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
-
 
 # ---------- MODELS ----------
 class Comp(BaseModel):
     source: str
-    url: Optional[str] = None
+    url: str
     brand: str
     model: str
     year: int
@@ -48,7 +76,6 @@ class Comp(BaseModel):
     drive: Optional[str] = None
     price_czk: int
     scraped_at: str
-
 
 class EstimateReq(BaseModel):
     brand: str
@@ -63,59 +90,10 @@ class EstimateReq(BaseModel):
     window_year: int = 1
     limit: int = 120
 
-
 # ---------- ROUTES ----------
 @app.get("/health")
 async def health():
     return {"ok": True, "service": "autoscan-backend"}
-
-
-@app.get("/debug/db")
-async def dbg_db():
-    # rychlá kontrola, jaký soubor SQLite se používá
-    return {"DB_PATH": DB_PATH}
-
-
-@app.get("/debug/count")
-async def dbg_count(
-    brand: str,
-    model: str,
-    year: int,
-    mileage: int,
-    window_km: int = 60000,
-    window_year: int = 3,
-):
-    """
-    Vrátí jen COUNT(*) pro stejný filtr jako /comps – užitečné pro ladění.
-    """
-    sql = """
-        SELECT COUNT(*)
-        FROM listings_fresh
-        WHERE LOWER(brand) LIKE LOWER(?)
-          AND LOWER(model) LIKE LOWER(?)
-          AND year BETWEEN ? AND ?
-          AND ABS(mileage - ?) <= ?
-    """
-    args = [
-        f"%{brand}%",
-        f"%{model}%",
-        year - window_year,
-        year + window_year,
-        mileage,
-        window_km,
-    ]
-
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute(sql, args)
-            row = await cur.fetchone()         # <-- správný způsob v aiosqlite
-            count = row[0] if row is not None else 0
-        return {"count": count, "args": args, "DB_PATH": DB_PATH}
-    except Exception as e:
-        # ať je při ladění hned vidět přesná chyba
-        raise HTTPException(status_code=500, detail=f"dbg_count error: {e}")
-
 
 @app.get("/comps", response_model=List[Comp])
 async def comps(
@@ -127,41 +105,57 @@ async def comps(
     motor: str = "",
     window_km: int = 20000,
     window_year: int = 1,
-    fresh_hours: int = FRESH_HOURS_DEFAULT,
+    fresh_hours: int = FRESH_HOURS_DEFAULT,  # zachován parametr (ignorujeme v vehicles_clean)
     limit: int = 120,
     x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
 ):
     """
-    Vrátí podobné inzeráty z listings_fresh (může to být i VIEW nad vehicles_clean).
-    Brand/model matchují přes LIKE (volnější chování).
-    Pokud scraped_at='n/a', ignoruje se čerstvost.
+    Hledá přímo v `vehicles_clean` na *normalizovaných* sloupcích:
+      - brand_fold, model_fold / model_base_fold (LIKE, bez diakritiky, case-insensitive)
+      - fuel_norm (rovnost)
+      - motor_fold (LIKE)
+    Rok a nájezd přes okna (±).
     """
     _auth(x_api_key)
 
+    brand_f = fold_input(brand)
+    model_f = fold_input(model)
+    fuel_n = norm_fuel(fuel)
+    motor_f = fold_input(motor)
+
+    # Pozn.: `vehicles_clean` nemá scraped_at ani price_czk => price_czk = price, scraped_at='n/a'
     sql = """
-    SELECT source,url,brand,model,year,mileage,fuel,motor,transmission,drive,price_czk,scraped_at
-    FROM listings_fresh
-    WHERE LOWER(brand) LIKE LOWER(?)
-      AND LOWER(model) LIKE LOWER(?)
+    SELECT
+      'seed'                         AS source,
+      COALESCE(url, 'local://vehicle/' || id) AS url,
+      brand                          AS brand,           -- vracíme původní hodnotu (s diakritikou)
+      model                          AS model,
+      CAST(year AS INTEGER)          AS year,
+      CAST(mileage AS INTEGER)       AS mileage,
+      fuel,
+      motor,
+      transmission,
+      drive,
+      CAST(price AS INTEGER)         AS price_czk,
+      'n/a'                          AS scraped_at
+    FROM vehicles_clean
+    WHERE brand_fold LIKE ?
+      AND (model_fold LIKE ? OR model_base_fold LIKE ?)
       AND year BETWEEN ? AND ?
       AND ABS(mileage - ?) <= ?
-      AND (?='' OR LOWER(fuel)  LIKE LOWER(?))
-      AND (?='' OR LOWER(motor) LIKE LOWER(?))
-      AND (scraped_at = 'n/a' OR datetime(scraped_at) >= datetime('now', '-' || ? || ' hours'))
+      AND (? = '' OR fuel_norm = ?)
+      AND (? = '' OR motor_fold LIKE ?)
     ORDER BY ABS(mileage - ?), ABS(year - ?)
     LIMIT ?
     """
 
     args = [
-        f"%{brand}%",
-        f"%{model}%",
-        year - window_year,
-        year + window_year,
-        mileage,
-        window_km,
-        (fuel or ""), f"%{(fuel or '').lower()}%",
-        (motor or ""), f"%{(motor or '').lower()}%",
-        fresh_hours,
+        f"%{brand_f}%",
+        f"%{model_f}%", f"%{model_f}%",
+        year - window_year, year + window_year,
+        mileage, window_km,
+        (fuel_n or ""), (fuel_n or ""),
+        (motor_f or ""), f"%{motor_f}%",
         mileage, year,
         limit,
     ]
@@ -169,12 +163,47 @@ async def comps(
     out: list[dict] = []
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute(sql, args)
-        rows = await cur.fetchall()
-        for r in rows:
-            out.append(dict(r))
+        async with db.execute(sql, args) as cur:
+            async for r in cur:
+                out.append(dict(r))
     return out
 
+@app.get("/debug/db")
+async def dbg_db():
+    return {"DB_PATH": DB_PATH}
+
+@app.get("/debug/count")
+async def dbg_count(
+    brand: str,
+    model: str,
+    year: int,
+    mileage: int,
+    window_km: int = 60000,
+    window_year: int = 3,
+):
+    brand_f = fold_input(brand)
+    model_f = fold_input(model)
+
+    sql = """
+    SELECT COUNT(*)
+    FROM vehicles_clean
+    WHERE brand_fold LIKE ?
+      AND (model_fold LIKE ? OR model_base_fold LIKE ?)
+      AND year BETWEEN ? AND ?
+      AND ABS(mileage - ?) <= ?
+    """
+    args = [
+        f"%{brand_f}%",
+        f"%{model_f}%", f"%{model_f}%",
+        year - window_year, year + window_year,
+        mileage, window_km,
+    ]
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(sql, args) as cur:
+            row = await cur.fetchone()
+            count = row[0] if row else 0
+    return {"count": count, "args": args, "DB_PATH": DB_PATH}
 
 @app.post("/price/estimate")
 async def price_estimate(
@@ -199,7 +228,6 @@ async def price_estimate(
             window_year=body.window_year,
             fresh_hours=body.fresh_hours,
             limit=body.limit,
-            x_api_key=x_api_key,
         )
 
     est = estimate_from_rows(rows, body.year, body.mileage, body.motor or "")
