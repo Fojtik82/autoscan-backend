@@ -1,18 +1,16 @@
 ﻿# app/api_server.py
 from typing import Optional, List
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import aiosqlite
+import math
+from statistics import median
 
 from .db import init_db, DB_PATH
 from .config import ALLOWED_ORIGINS, API_KEY, FRESH_HOURS_DEFAULT
-from .estimators import estimate_from_rows
 
-
-# ------------------------------------------------------------
-# FastAPI
-# ------------------------------------------------------------
+# --- FastAPI instance ---
 app = FastAPI(title="AutoScan Comps API", version="1.0")
 
 # CORS
@@ -23,6 +21,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # Init DB při startu
 @app.on_event("startup")
@@ -35,50 +34,7 @@ def _auth(x_api_key: Optional[str]):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-# ------------------------------------------------------------
-# Pomocné normalizace (fold bez diakritiky) + fuel norm
-# ------------------------------------------------------------
-def _fold(s: str) -> str:
-    """
-    Přibližné "oddiakritikování" + lowercase, stejné jako v DB sloupcích *_fold.
-    """
-    x = (s or "").strip().lower()
-    return (
-        x.replace("á", "a").replace("ä", "a").replace("â", "a")
-         .replace("č", "c")
-         .replace("ď", "d")
-         .replace("é", "e").replace("ě", "e").replace("ë", "e")
-         .replace("í", "i").replace("ï", "i")
-         .replace("ľ", "l").replace("ĺ", "l")
-         .replace("ň", "n")
-         .replace("ó", "o").replace("ô", "o")
-         .replace("ř", "r")
-         .replace("š", "s")
-         .replace("ť", "t")
-         .replace("ú", "u").replace("ů", "u").replace("ü", "u")
-         .replace("ý", "y")
-         .replace("ž", "z")
-    )
-
-def _norm_fuel(s: str) -> str:
-    """
-    Vrátí normalizované palivo do `fuel_norm` sloupce, nebo prázdný string.
-    """
-    if not s:
-        return ""
-    x = _fold(s)
-    if "naft" in x or "diesel" in x:   # cz/sk/en
-        return "diesel"
-    if "benz" in x or "petrol" in x or "gasolin" in x:
-        return "petrol"
-    if x.startswith("elect"):
-        return "elect."
-    return x
-
-
-# ------------------------------------------------------------
-# MODELS
-# ------------------------------------------------------------
+# ---------- MODELS ----------
 class Comp(BaseModel):
     source: str
     url: Optional[str] = None
@@ -101,6 +57,7 @@ class EstimateReq(BaseModel):
     mileage: int
     fuel: Optional[str] = ""
     motor: Optional[str] = ""
+    # volitelné – pokud pošleš rovnou řádky, použijí se
     rows: Optional[list[dict]] = None
     fresh_hours: int = FRESH_HOURS_DEFAULT
     window_km: int = 20000
@@ -108,9 +65,25 @@ class EstimateReq(BaseModel):
     limit: int = 120
 
 
-# ------------------------------------------------------------
-# ROUTES
-# ------------------------------------------------------------
+# ---------- HELPERS ----------
+def _summarize_prices(prices: list[int | float]) -> dict:
+    """Vrátí count, median, mean, min, max (zaokrouhlené na celé CZK)."""
+    if not prices:
+        return {}
+    prices_sorted = sorted(float(p) for p in prices)
+    n = len(prices_sorted)
+    med = median(prices_sorted)
+    mean = sum(prices_sorted) / n
+    return {
+        "count": n,
+        "median": int(round(med)),
+        "mean": int(round(mean)),
+        "min": int(round(prices_sorted[0])),
+        "max": int(round(prices_sorted[-1])),
+    }
+
+
+# ---------- ROUTES ----------
 @app.get("/health")
 async def health():
     return {"ok": True, "service": "autoscan-backend"}
@@ -118,40 +91,41 @@ async def health():
 
 @app.get("/debug/db")
 async def dbg_db():
-    return {"DB_PATH": str(DB_PATH)}
+    # ukáže, jakou DB skutečně používá server
+    return {"DB_PATH": DB_PATH}
 
 
 @app.get("/debug/count")
 async def dbg_count(
-    brand: str,
-    model: str,
-    year: int,
-    mileage: int,
+    brand: str = Query(...),
+    model: str = Query(...),
+    year: int = Query(...),
+    mileage: int = Query(...),
     window_km: int = 20000,
     window_year: int = 1,
 ):
-    """
-    Rychlý COUNT přímo nad vehicles_clean přes *_fold (diakritika-insensitive).
-    """
-    bf = f"%{_fold(brand)}%"
-    mf = f"%{_fold(model)}%"
-    y0, y1 = year - window_year, year + window_year
-
     sql = """
-      SELECT COUNT(*)
-      FROM vehicles_clean
-      WHERE brand_fold LIKE ?
-        AND (model_fold LIKE ? OR model_base_fold LIKE ?)
-        AND year BETWEEN ? AND ?
-        AND ABS(mileage - ?) <= ?
+    SELECT COUNT(*)
+    FROM listings_fresh
+    WHERE LOWER(brand) LIKE LOWER(?)
+      AND LOWER(model) LIKE LOWER(?)
+      AND year BETWEEN ? AND ?
+      AND ABS(mileage - ?) <= ?
     """
-    args = (bf, mf, mf, y0, y1, mileage, window_km)
-
+    args = [
+        f"%{brand}%",
+        f"%{model}%",
+        year - window_year,
+        year + window_year,
+        mileage,
+        window_km,
+    ]
     async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         async with db.execute(sql, args) as cur:
             row = await cur.fetchone()
-
-    return {"count": (row[0] if row else 0), "args": list(args), "DB_PATH": str(DB_PATH)}
+            count = row[0] if row else 0
+    return {"count": count, "args": args, "DB_PATH": DB_PATH}
 
 
 @app.get("/comps", response_model=List[Comp])
@@ -164,43 +138,41 @@ async def comps(
     motor: str = "",
     window_km: int = 20000,
     window_year: int = 1,
-    fresh_hours: int = FRESH_HOURS_DEFAULT,  # ignorováno (v local DB je 'n/a')
+    fresh_hours: int = FRESH_HOURS_DEFAULT,
     limit: int = 120,
     x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
 ):
     """
-    Najde podobné záznamy přímo ve `vehicles_clean` s využitím *_fold sloupců.
+    Vrátí podobné inzeráty z `listings_fresh` (VIEW nad vehicles_clean).
+    Brand/model matchují přes LIKE.
+    Pokud scraped_at='n/a', ignoruje se čerstvost.
     """
     _auth(x_api_key)
 
-    bf = f"%{_fold(brand)}%"
-    mf = f"%{_fold(model)}%"
-    fn = _norm_fuel(fuel)
-    mot_like = f"%{_fold(motor)}%" if motor else ""
-
     sql = """
-    SELECT
-      'seed' AS source,
-      'local://vehicle/' || CAST(id AS TEXT) AS url,
-      brand, model, year, mileage, fuel, motor, transmission, drive,
-      CAST(price AS INTEGER) AS price_czk,
-      'n/a' AS scraped_at
-    FROM vehicles_clean
-    WHERE brand_fold LIKE ?
-      AND (model_fold LIKE ? OR model_base_fold LIKE ?)
+    SELECT source,url,brand,model,year,mileage,fuel,motor,transmission,drive,price_czk,scraped_at
+    FROM listings_fresh
+    WHERE LOWER(brand) LIKE LOWER(?)
+      AND LOWER(model) LIKE LOWER(?)
       AND year BETWEEN ? AND ?
       AND ABS(mileage - ?) <= ?
-      AND (? = '' OR fuel_norm = ?)
-      AND (? = '' OR motor_fold LIKE ?)
+      AND (?='' OR LOWER(fuel)  LIKE LOWER(?))
+      AND (?='' OR LOWER(motor) LIKE LOWER(?))
+      AND (scraped_at = 'n/a' OR datetime(scraped_at) >= datetime('now', '-' || ? || ' hours'))
     ORDER BY ABS(mileage - ?), ABS(year - ?)
     LIMIT ?
     """
+
     args = [
-        bf, mf, mf,
-        year - window_year, year + window_year,
-        mileage, window_km,
-        fn, fn,
-        mot_like, mot_like,
+        f"%{brand}%",
+        f"%{model}%",
+        year - window_year,
+        year + window_year,
+        mileage,
+        window_km,
+        (fuel or ""), f"%{(fuel or '').lower()}%",
+        (motor or ""), f"%{(motor or '').lower()}%",
+        fresh_hours,
         mileage, year,
         limit,
     ]
@@ -209,9 +181,8 @@ async def comps(
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(sql, args) as cur:
-            rows = await cur.fetchall()
-            out = [dict(r) for r in rows]
-
+            async for r in cur:
+                out.append(dict(r))
     return out
 
 
@@ -221,8 +192,8 @@ async def price_estimate(
     x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
 ):
     """
-    Spočítá odhad ceny z nalezených compů (vážený medián + IQR).
-    Pokud `rows` nejsou dodané, zavolá interně /comps se stejnými parametry.
+    Spočítá souhrn (count, median, mean, min, max) z /comps
+    nebo z `rows` pokud je klient pošle přímo.
     """
     _auth(x_api_key)
 
@@ -242,9 +213,26 @@ async def price_estimate(
             x_api_key=x_api_key,
         )
 
-    est = estimate_from_rows(rows, body.year, body.mileage, body.motor or "")
-    if not est:
+    # vytáhnout ceny
+    prices = []
+    for r in rows:
+        p = r.get("price_czk")
+        if isinstance(p, (int, float)) and p > 0:
+            prices.append(p)
+
+    if not prices:
         return {"found": 0, "message": "No comparable rows"}
 
-    est["found"] = est["count"]
-    return est
+    summary = _summarize_prices(prices)
+    # pro kompatibilitu s frontendem pojmenujeme klíče i „low/high/price“
+    return {
+        "price_czk": summary["median"],
+        "low_czk": int(round(summary["mean"] * 0.92)),   # volitelný „rozptyl“
+        "high_czk": int(round(summary["mean"] * 1.15)),  # volitelný „rozptyl“
+        "count": summary["count"],
+        "found": summary["count"],
+        "mean": summary["mean"],
+        "median": summary["median"],
+        "min": summary["min"],
+        "max": summary["max"],
+    }
