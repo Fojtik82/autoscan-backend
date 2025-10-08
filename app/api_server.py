@@ -1,251 +1,221 @@
-﻿# app/api_server.py
-import os
+﻿import os
+import asyncio
 import math
-import json
-import unicodedata
-from typing import Optional, List, Dict, Any
-
-import aiosqlite
-from fastapi import FastAPI, Query, Body
+from typing import Any, Dict, List, Optional
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import aiosqlite
+import statistics
 
-# ---------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------
-def _norm(s: Optional[str]) -> str:
-    """lower + odstranění diakritiky + ořez"""
-    if not s:
-        return ""
-    s = s.strip().lower()
-    s = unicodedata.normalize("NFKD", s)
-    return "".join(ch for ch in s if not unicodedata.combining(ch))
+DB_PATH = os.getenv("DB_PATH", "vehicles_ai.db")
 
-# Palivové aliasy (klíče i hodnoty jsou již 'norm()')
-FUEL_ALIASES: Dict[str, List[str]] = {
-    "ba":       ["ba", "benzin", "benzín", "petrol", "gasoline"],
-    "benzin":   ["ba", "benzin", "benzín", "petrol", "gasoline"],
-    "benzín":   ["ba", "benzin", "benzín", "petrol", "gasoline"],
-    "nafta":    ["nafta", "diesel", "d"],
-    "diesel":   ["nafta", "diesel", "d"],
-    "lpg":      ["lpg", "autoplyn"],
-    "cng":      ["cng", "zemni plyn", "zemní plyn"],
-    "hybrid":   ["hybrid", "hev", "phev"],
-    "elektro":  ["elektro", "ev", "electric"],
-}
-
-def _int_or_none(x: Optional[int]) -> Optional[int]:
-    try:
-        return int(x) if x is not None else None
-    except Exception:
-        return None
-
-# ---------------------------------------------------------
-# Config
-# ---------------------------------------------------------
-# Výchozí cesta k DB – na Renderu je projekt v /opt/render/project/src/
-DEFAULT_DB = "/opt/render/project/src/vehicles_ai.db"
-DB_PATH = os.getenv("DB_FILE") or (DEFAULT_DB if os.path.exists(DEFAULT_DB) else "./vehicles_ai.db")
-
-ALLOWED_ORIGINS = [o.strip() for o in (os.getenv("ALLOWED_ORIGINS") or "*").split(",")]
-
-app = FastAPI(title="AutoScan Comps API", version="1.0")
+app = FastAPI(title="AutoScan Backend API", version="1.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else ["*"],
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------
-# Pydantic model pro POST /price/estimate
-# ---------------------------------------------------------
-class EstimateReq(BaseModel):
+# -----------------------------------------------------------
+# MODELY
+# -----------------------------------------------------------
+
+class PriceEstimateRequest(BaseModel):
     brand: str
     model: str
     year: int
     mileage: int
     fuel: Optional[str] = None
     motor: Optional[str] = None
-    window_km: Optional[int] = 20000
-    window_year: Optional[int] = 1
-    fresh_hours: Optional[int] = 999999
-    limit: Optional[int] = 120
+    window_km: int = 200000
+    window_year: int = 1
+    fresh_hours: int = 999999
+    limit: int = 120
 
-# ---------------------------------------------------------
-# Debug/health
-# ---------------------------------------------------------
-@app.get("/health")
-async def health():
-    return {"ok": True, "service": "autoscan_backend"}
 
-@app.get("/debug/db")
-async def dbg_db():
-    return {"DB_PATH": DB_PATH}
+# -----------------------------------------------------------
+# PŘIPOJENÍ K DATABÁZI
+# -----------------------------------------------------------
 
-@app.get("/debug/count")
-async def dbg_count(
-    brand: str = Query(...),
-    model: str = Query(...),
-    year: int = Query(...),
-    mileage: int = Query(...),
-    window_km: int = Query(20000),
-    window_year: int = Query(1),
-    fuel: Optional[str] = Query(None),
-    motor: Optional[str] = Query(None),
-    fresh_hours: int = Query(999999),
-):
-    rows = await _query_rows(
-        brand=brand, model=model, year=year, mileage=mileage,
-        window_km=window_km, window_year=window_year,
-        fuel=fuel, motor=motor, fresh_hours=fresh_hours, limit=999999
-    )
-    return {"count": len(rows), "args": locals(), "DB_PATH": DB_PATH}
+async def _get_db():
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+    return db
 
-# ---------------------------------------------------------
-# Core SELECT – používá /comps i /price/estimate
-# ---------------------------------------------------------
+
+# -----------------------------------------------------------
+# FUNKCE NAČTENÍ ZÁZNAMŮ – OPRAVENÁ VERZE
+# -----------------------------------------------------------
+
 async def _query_rows(
     *,
     brand: str,
     model: str,
     year: int,
     mileage: int,
-    window_km: int = 20000,
-    window_year: int = 1,
+    window_km: int,
+    window_year: int,
     fuel: Optional[str] = None,
     motor: Optional[str] = None,
-    fresh_hours: int = 999999,
     limit: int = 120,
+    fresh_hours: int = 999999,
 ) -> List[Dict[str, Any]]:
-    where: List[str] = []
+    """
+    Dotazuje view 'listings_fresh' nebo tabulku s inzeráty.
+    Nepoužívá brand_fold / model_fold / fuel_norm.
+    Porovnává case-insensitive přes LOWER() a LIKE.
+    """
+    db = await _get_db()
+
+    where = []
     params: List[Any] = []
 
-    # diakritika-insensitive match na značku/model (použijeme *_fold sloupce)
-    brand_n = _norm(brand)
-    model_n = _norm(model)
-    where.append("brand_fold = ?")
-    params.append(brand_n)
-    where.append("model_fold = ?")
-    params.append(model_n)
+    # značka + model (case-insensitive)
+    where.append("LOWER(brand) = LOWER(?)")
+    params.append(brand)
+    where.append("LOWER(model) = LOWER(?)")
+    params.append(model)
 
     # rok ± okno
-    year = int(year)
-    y_min, y_max = year - int(window_year), year + int(window_year)
-    where.append("year BETWEEN ? AND ?")
-    params += [y_min, y_max]
+    where.append("(year BETWEEN ? AND ?)")
+    params.extend([year - window_year, year + window_year])
 
     # nájezd ± okno
-    mileage = int(mileage)
-    km_min = max(0, mileage - int(window_km))
-    km_max = max(km_min, mileage + int(window_km))
-    where.append("mileage BETWEEN ? AND ?")
-    params += [km_min, km_max]
+    where.append("(mileage BETWEEN ? AND ?)")
+    params.extend([max(0, mileage - window_km), mileage + window_km])
 
-    # čerstvost (pokud máš timestamp; ve seed je 'n/a', tak podmínku vynecháváme)
-    # V tvé DB je view 'listings_fresh' už očištěné – použijeme ho
-    table = "listings_fresh"
+    # volitelné: palivo
+    if fuel:
+        f = fuel.strip().lower()
+        where.append("(LOWER(fuel) = ? OR LOWER(fuel) LIKE ?)")
+        params.extend([f, f"%{f}%"])
 
-    # FUEL aliasy (BA ~ benzin, Diesel ~ nafta)
-    f_norm = _norm(fuel) if fuel else ""
-    if f_norm:
-        tokens = FUEL_ALIASES.get(f_norm, [f_norm])
-        placeholders = ",".join(["?"] * len(tokens))
-        where.append(f"fuel_norm IN ({placeholders})")
-        params += tokens
-
-    # MOTOR – podřetězcové LIKE bez diakritiky
-    m_norm = _norm(motor) if motor else ""
-    if m_norm:
-        like = f"%{m_norm}%"
-        where.append("(motor_fold LIKE ? OR lower(motor) LIKE ?)")
-        params += [like, like]
+    # volitelné: motor
+    if motor:
+        m = motor.strip().lower()
+        where.append("LOWER(motor) LIKE ?")
+        params.append(f"%{m}%")
 
     sql = f"""
-        SELECT source, url, brand, model, year, mileage, fuel, motor,
-               transmission, drive, price_czk, scraped_at
-        FROM {table}
+        SELECT
+            source, url, brand, model, year, mileage,
+            fuel, motor, transmission, drive, price_czk, scraped_at
+        FROM listings_fresh
         WHERE {" AND ".join(where)}
-        ORDER BY year DESC, ABS(mileage - ?) ASC
+        ORDER BY ABS(year - ?) ASC, ABS(mileage - ?) ASC, price_czk ASC
         LIMIT ?
     """
-    params += [mileage, int(limit)]
 
-    async with aiosqlite.connect(DB_PATH, isolation_level=None) as db:
-        db.row_factory = aiosqlite.Row
-        rows = await db.execute_fetchall(sql, tuple(params))
-        return [dict(r) for r in rows]
+    params.extend([year, mileage, limit])
+    rows = await db.execute_fetchall(sql, tuple(params))
 
-# ---------------------------------------------------------
-# GET /comps – vrací porovnatelné inzeráty
-# ---------------------------------------------------------
+    # vytvoř dict seznam
+    return [dict(r) for r in rows]
+
+
+# -----------------------------------------------------------
+# /comps – výpis srovnatelných vozů
+# -----------------------------------------------------------
+
 @app.get("/comps")
-async def comps(
-    brand: str = Query(..., description="Značka"),
-    model: str = Query(..., description="Model"),
+async def get_comparables(
+    brand: str = Query(...),
+    model: str = Query(...),
     year: int = Query(...),
     mileage: int = Query(...),
-    window_km: int = Query(20000),
+    window_km: int = Query(200000),
     window_year: int = Query(1),
     fuel: Optional[str] = Query(None),
     motor: Optional[str] = Query(None),
-    fresh_hours: int = Query(999999),
     limit: int = Query(120),
+    fresh_hours: int = Query(999999),
 ):
     rows = await _query_rows(
-        brand=brand, model=model, year=year, mileage=mileage,
-        window_km=window_km, window_year=window_year,
-        fuel=fuel, motor=motor, fresh_hours=fresh_hours, limit=limit
+        brand=brand,
+        model=model,
+        year=year,
+        mileage=mileage,
+        window_km=window_km,
+        window_year=window_year,
+        fuel=fuel,
+        motor=motor,
+        limit=limit,
+        fresh_hours=fresh_hours,
     )
     return rows
 
-# ---------------------------------------------------------
-# POST /price/estimate – spočítá cenu (median + IQR)
-# ---------------------------------------------------------
+
+# -----------------------------------------------------------
+# /price/estimate – odhad ceny
+# -----------------------------------------------------------
+
 @app.post("/price/estimate")
-async def price_estimate(req: EstimateReq = Body(...)):
+async def price_estimate(req: PriceEstimateRequest):
     rows = await _query_rows(
         brand=req.brand,
         model=req.model,
         year=req.year,
         mileage=req.mileage,
-        window_km=_int_or_none(req.window_km) or 20000,
-        window_year=_int_or_none(req.window_year) or 1,
+        window_km=req.window_km,
+        window_year=req.window_year,
         fuel=req.fuel,
         motor=req.motor,
-        fresh_hours=_int_or_none(req.fresh_hours) or 999999,
-        limit=_int_or_none(req.limit) or 120,
+        limit=req.limit,
+        fresh_hours=req.fresh_hours,
     )
-    prices = [int(r["price_czk"]) for r in rows if r.get("price_czk") is not None]
-    if not prices:
+
+    if not rows:
         return {"found": 0, "message": "No comparable rows"}
 
-    prices.sort()
-    n = len(prices)
+    prices = [r["price_czk"] for r in rows if r["price_czk"]]
 
-    def _pct(p: float) -> float:
-        # lineární interpolace percentilu
-        k = (n - 1) * p
-        f = math.floor(k)
-        c = math.ceil(k)
-        if f == c:
-            return float(prices[int(k)])
-        return prices[f] + (prices[c] - prices[f]) * (k - f)
+    if not prices:
+        return {"found": len(rows), "message": "No price data"}
 
-    q1 = _pct(0.25)
-    q2 = _pct(0.50)  # median
-    q3 = _pct(0.75)
+    # výpočty
+    mean_price = statistics.mean(prices)
+    median_price = statistics.median(prices)
+    low = max(min(prices), median_price * 0.94)
+    high = min(max(prices), median_price * 1.18)
 
     return {
-        "price_czk": round(q2),
-        "low_czk": round(q1),
-        "high_czk": round(q3),
-        "count": n,
-        "found": n,
-        "mean": round(sum(prices) / n),
-        "median": round(q2),
+        "price_czk": round(median_price),
+        "low_czk": round(low),
+        "high_czk": round(high),
+        "count": len(prices),
+        "found": len(prices),
+        "mean": round(mean_price),
+        "median": round(median_price),
         "min": min(prices),
         "max": max(prices),
     }
+
+
+# -----------------------------------------------------------
+# /health – kontrola
+# -----------------------------------------------------------
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "service": "autoscan_backend"}
+
+
+# -----------------------------------------------------------
+# /debug/db – ověření cesty k DB
+# -----------------------------------------------------------
+
+@app.get("/debug/db")
+async def debug_db():
+    return {"DB_PATH": DB_PATH}
+
+
+# -----------------------------------------------------------
+# SPUŠTĚNÍ (lokálně)
+# -----------------------------------------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
