@@ -47,7 +47,49 @@ async def _get_db():
 
 
 # -----------------------------------------------------------
-# FUNKCE NAČTENÍ ZÁZNAMŮ – OPRAVENÁ VERZE
+# Pomocné: normalizace paliva (synonyma → LIKE patterny)
+# -----------------------------------------------------------
+
+def _fuel_patterns(user_fuel: str) -> List[str]:
+    """
+    Vrátí sadu LIKE patternů pro různé zápisy paliva.
+    Používáme jen patterny na straně sloupce (LOWER(fuel) LIKE ?),
+    takže diakritika v DB nevadí.
+    """
+    f = (user_fuel or "").strip().lower()
+    if not f:
+        return []
+
+    # Diesel / Nafta
+    if f in {"nafta", "diesel", "d", "de", "dizel", "dízel"}:
+        return ["%naft%", "%dies%"]
+
+    # Benzín / Benzín / BA / petrol
+    if f in {"benzin", "benzín", "ba", "petrol", "gasoline", "benz"}:
+        return ["%benz%"]
+
+    # LPG / plyn
+    if f in {"lpg", "autoplyn", "plyn"}:
+        return ["%lpg%", "%autoplyn%", "%plyn%"]
+
+    # CNG
+    if f in {"cng"}:
+        return ["%cng%"]
+
+    # Hybrid
+    if f in {"hybrid", "hev", "phev", "plugin-hybrid", "plug-in hybrid", "plug-in"}:
+        return ["%hybr%"]
+
+    # Elektro
+    if f in {"ev", "electro", "electric", "elektro"}:
+        return ["%elekt%"]
+
+    # fallback – necháme substring
+    return [f"%{f}%"]
+
+
+# -----------------------------------------------------------
+# FUNKCE NAČTENÍ ZÁZNAMŮ – OPRAVENÁ A ROZŠÍŘENÁ
 # -----------------------------------------------------------
 
 async def _query_rows(
@@ -64,13 +106,13 @@ async def _query_rows(
     fresh_hours: int = 999999,
 ) -> List[Dict[str, Any]]:
     """
-    Dotazuje view 'listings_fresh' nebo tabulku s inzeráty.
+    Dotazuje view 'listings_fresh' (nebo tabulku s inzeráty).
     Nepoužívá brand_fold / model_fold / fuel_norm.
     Porovnává case-insensitive přes LOWER() a LIKE.
     """
     db = await _get_db()
 
-    where = []
+    where: List[str] = []
     params: List[Any] = []
 
     # značka + model (case-insensitive)
@@ -87,17 +129,26 @@ async def _query_rows(
     where.append("(mileage BETWEEN ? AND ?)")
     params.extend([max(0, mileage - window_km), mileage + window_km])
 
-    # volitelné: palivo
+    # volitelné: palivo (synonyma/diakritika tolerantní)
     if fuel:
-        f = fuel.strip().lower()
-        where.append("(LOWER(fuel) = ? OR LOWER(fuel) LIKE ?)")
-        params.extend([f, f"%{f}%"])
+        pats = _fuel_patterns(fuel)
+        if pats:
+            where.append("(" + " OR ".join(["LOWER(fuel) LIKE ?"] * len(pats)) + ")")
+            params.extend(pats)
 
-    # volitelné: motor
+    # volitelné: motor – tolerantní na mezery a velikost písmen, např. "g4fa"
     if motor:
         m = motor.strip().lower()
-        where.append("LOWER(motor) LIKE ?")
-        params.append(f"%{m}%")
+        if m:
+            # 1) hledat bez mezer v obou tvarech
+            where.append(
+                "("
+                "LOWER(REPLACE(COALESCE(motor,''), ' ', '')) LIKE ?"
+                " OR LOWER(COALESCE(motor,'')) LIKE ?"
+                ")"
+            )
+            params.append(f"%{m.replace(' ', '')}%")
+            params.append(f"%{m}%")
 
     sql = f"""
         SELECT
@@ -110,9 +161,8 @@ async def _query_rows(
     """
 
     params.extend([year, mileage, limit])
-    rows = await db.execute_fetchall(sql, tuple(params))
 
-    # vytvoř dict seznam
+    rows = await db.execute_fetchall(sql, tuple(params))
     return [dict(r) for r in rows]
 
 
