@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import aiosqlite
 import statistics
+import unicodedata
 
 DB_PATH = os.getenv("DB_PATH", "vehicles_ai.db")
 
@@ -47,49 +48,67 @@ async def _get_db():
 
 
 # -----------------------------------------------------------
-# Pomocné: normalizace paliva (synonyma → LIKE patterny)
+# Pomocné: fold bez diakritiky + lowercase
 # -----------------------------------------------------------
 
+def _fold(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    x = unicodedata.normalize("NFD", s)
+    x = "".join(ch for ch in x if unicodedata.category(ch) != "Mn")
+    return x.lower().strip()
+
+
+# -----------------------------------------------------------
+# Pomocné: fuel → norm label / LIKE patterny
+# -----------------------------------------------------------
+
+def _fuel_norm(user_fuel: str) -> Optional[str]:
+    f = (user_fuel or "").strip().lower()
+    if not f:
+        return None
+    if any(k in f for k in ["naft", "diesel", "dízel", "dizel"]):
+        return "diesel"
+    if any(k in f for k in ["benz", "petrol", "gasoline", "ba"]):
+        return "petrol"
+    if "hybr" in f:
+        return "hybrid"
+    if any(k in f for k in ["ev", "elekt", "electr"]):
+        return "elect."
+    if "lpg" in f or "plyn" in f:
+        return "lpg"
+    if "cng" in f:
+        return "cng"
+    return None
+
 def _fuel_patterns(user_fuel: str) -> List[str]:
-    """
-    Vrátí sadu LIKE patternů pro různé zápisy paliva.
-    Používáme jen patterny na straně sloupce (LOWER(fuel) LIKE ?),
-    takže diakritika v DB nevadí.
-    """
     f = (user_fuel or "").strip().lower()
     if not f:
         return []
-
     # Diesel / Nafta
     if f in {"nafta", "diesel", "d", "de", "dizel", "dízel"}:
         return ["%naft%", "%dies%"]
-
-    # Benzín / Benzín / BA / petrol
+    # Benzín / BA / petrol
     if f in {"benzin", "benzín", "ba", "petrol", "gasoline", "benz"}:
         return ["%benz%"]
-
     # LPG / plyn
     if f in {"lpg", "autoplyn", "plyn"}:
         return ["%lpg%", "%autoplyn%", "%plyn%"]
-
     # CNG
     if f in {"cng"}:
         return ["%cng%"]
-
     # Hybrid
     if f in {"hybrid", "hev", "phev", "plugin-hybrid", "plug-in hybrid", "plug-in"}:
         return ["%hybr%"]
-
     # Elektro
     if f in {"ev", "electro", "electric", "elektro"}:
         return ["%elekt%"]
-
-    # fallback – necháme substring
+    # fallback
     return [f"%{f}%"]
 
 
 # -----------------------------------------------------------
-# FUNKCE NAČTENÍ ZÁZNAMŮ – OPRAVENÁ A ROZŠÍŘENÁ
+# FUNKCE NAČTENÍ ZÁZNAMŮ – rozšířená (fold LIKE + fuel_norm)
 # -----------------------------------------------------------
 
 async def _query_rows(
@@ -107,40 +126,57 @@ async def _query_rows(
 ) -> List[Dict[str, Any]]:
     """
     Dotazuje view 'listings_fresh' (nebo tabulku s inzeráty).
-    Nepoužívá brand_fold / model_fold / fuel_norm.
-    Porovnává case-insensitive přes LOWER() a LIKE.
+    - Značka/model: fold + LIKE přes brand_fold/model_fold/model_base_fold (fallback na LOWER(brand/model)).
+    - Palivo: preferuje fuel_norm (= diesel/petrol/elect./...), jinak LIKE patterny.
+    - Motor: tolerantní LIKE (bez mezer i s mezerami).
     """
     db = await _get_db()
 
     where: List[str] = []
     params: List[Any] = []
 
-    # značka + model (case-insensitive)
-    where.append("LOWER(brand) = LOWER(?)")
-    params.append(brand)
-    where.append("LOWER(model) = LOWER(?)")
-    params.append(model)
+    # --- brand/model: fold + LIKE ---
+    brand_pat = f"%{_fold(brand)}%"
+    model_pat = f"%{_fold(model)}%"
 
-    # rok ± okno
+    # COALESCE zajistí, že když view nemá *_fold, spadne to na LOWER(brand/model)
+    where.append("COALESCE(brand_fold, LOWER(brand)) LIKE ?")
+    params.append(brand_pat)
+
+    where.append("("
+                 "COALESCE(model_fold, LOWER(model)) LIKE ?"
+                 " OR COALESCE(model_base_fold, COALESCE(model_fold, LOWER(model))) LIKE ?"
+                 ")")
+    params.extend([model_pat, model_pat])
+
+    # --- rok ± okno ---
     where.append("(year BETWEEN ? AND ?)")
     params.extend([year - window_year, year + window_year])
 
-    # nájezd ± okno
+    # --- nájezd ± okno ---
     where.append("(mileage BETWEEN ? AND ?)")
     params.extend([max(0, mileage - window_km), mileage + window_km])
 
-    # volitelné: palivo (synonyma/diakritika tolerantní)
+    # --- palivo ---
     if fuel:
-        pats = _fuel_patterns(fuel)
-        if pats:
-            where.append("(" + " OR ".join(["LOWER(fuel) LIKE ?"] * len(pats)) + ")")
-            params.extend(pats)
+        norm = _fuel_norm(fuel)
+        if norm:
+            # preferuj fuel_norm, fallback na LOWER(fuel) LIKE
+            where.append("("
+                         "COALESCE(fuel_norm, '') = ?"
+                         " OR LOWER(fuel) LIKE ?"
+                         ")")
+            params.extend([norm, f"%{norm}%"])
+        else:
+            pats = _fuel_patterns(fuel)
+            if pats:
+                where.append("(" + " OR ".join(["LOWER(fuel) LIKE ?"] * len(pats)) + ")")
+                params.extend(pats)
 
-    # volitelné: motor – tolerantní na mezery a velikost písmen, např. "g4fa"
+    # --- motor (např. 'g4fa', '2.0 tdi') ---
     if motor:
         m = motor.strip().lower()
         if m:
-            # 1) hledat bez mezer v obou tvarech
             where.append(
                 "("
                 "LOWER(REPLACE(COALESCE(motor,''), ' ', '')) LIKE ?"
