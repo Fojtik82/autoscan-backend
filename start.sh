@@ -2,8 +2,6 @@
 set -e
 
 # 1) Stáhnout DB, pokud chybí
-# Nastav v Renderu ENV proměnnou DB_URL, např.:
-# https://github.com/Fojtik82/autoscan-backend/releases/download/v1-db/vehicles_ai.db
 if [ ! -f vehicles_ai.db ]; then
   if [ -n "$DB_URL" ]; then
     echo ">> Downloading DB from $DB_URL"
@@ -27,13 +25,11 @@ python - <<'PY'
 import sqlite3
 
 DB = "vehicles_ai.db"
-TABLE = "vehicles_clean"  # když bys v budoucnu použil jiný název tabulky, změň tady
+TABLE = "vehicles_clean"
 
 con = sqlite3.connect(DB)
 cur = con.cursor()
 
-# Zjistí dostupné sloupce a dynamicky poskládá VIEW tak,
-# aby fungovalo ať už máš price/price_czk a máš/nemáš *_fold sloupce.
 cols = {row[1] for row in cur.execute(f"PRAGMA table_info({TABLE})").fetchall()}
 
 def pick(*options, default="NULL"):
@@ -99,5 +95,5 @@ con.close()
 print("OK: listings_fresh view ready.")
 PY
 
-# 3) Spustit API (Render předává $PORT)
+# 3) Spustit API
 exec uvicorn app.api_server:app --host 0.0.0.0 --port $PORT
