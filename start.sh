@@ -1,23 +1,28 @@
 ﻿#!/usr/bin/env bash
 set -e
 
-# 1) Stáhnout DB, pokud chybí
-if [ ! -f vehicles_ai.db ]; then
-  if [ -n "$DB_URL" ]; then
-    echo ">> Downloading DB from $DB_URL"
-    curl -L "$DB_URL" -o vehicles_ai.db
-  elif [ -f vehicles_ai.zip ]; then
-    echo ">> Extracting vehicles_ai.zip"
-    python - <<'PY'
-import zipfile
+# 1) Připravit DB
+# Priorita:
+#   1) Pokud existuje vehicles_ai.zip -> vždy rozbalit na vehicles_ai.db (přepíše starou DB)
+#   2) Jinak, pokud je nastaven DB_URL a DB neexistuje -> stáhnout
+#   3) Jinak, pokud DB neexistuje -> chyba
+
+if [ -f vehicles_ai.zip ]; then
+  echo ">> Extracting vehicles_ai.zip -> vehicles_ai.db"
+  python - <<'PY'
+import zipfile, os
 z = zipfile.ZipFile('vehicles_ai.zip')
 z.extract('vehicles_ai.db')
-print('DB extracted')
+print("DB extracted, size:", os.path.getsize("vehicles_ai.db"), "bytes")
 PY
-  else
-    echo "ERROR: vehicles_ai.db not found and DB_URL not set (nor vehicles_ai.zip present)."
-    exit 1
-  fi
+
+elif [ -n "${DB_URL:-}" ] && [ ! -f vehicles_ai.db ]; then
+  echo ">> Downloading DB from $DB_URL"
+  curl -L "$DB_URL" -o vehicles_ai.db
+
+elif [ ! -f vehicles_ai.db ]; then
+  echo "ERROR: vehicles_ai.db not found and no vehicles_ai.zip or DB_URL configured."
+  exit 1
 fi
 
 # 2) Vytvořit/obnovit VIEW listings_fresh podle dostupných sloupců
@@ -25,11 +30,13 @@ python - <<'PY'
 import sqlite3
 
 DB = "vehicles_ai.db"
-TABLE = "vehicles_clean"
+TABLE = "vehicles_clean"  # pokud by ses někdy rozhodl jinak, změň název tabulky tady
 
 con = sqlite3.connect(DB)
 cur = con.cursor()
 
+# Zjistí dostupné sloupce a dynamicky poskládá VIEW tak,
+# aby fungovalo ať už máš price/price_czk a máš/nemáš *_fold sloupce.
 cols = {row[1] for row in cur.execute(f"PRAGMA table_info({TABLE})").fetchall()}
 
 def pick(*options, default="NULL"):
@@ -95,5 +102,5 @@ con.close()
 print("OK: listings_fresh view ready.")
 PY
 
-# 3) Spustit API
+# 3) Spustit API (Render předává $PORT)
 exec uvicorn app.api_server:app --host 0.0.0.0 --port $PORT
